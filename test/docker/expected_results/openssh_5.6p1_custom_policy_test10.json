@@ -29,5 +29,6 @@
     "passed": false,
     "policy": "Docker poliicy: test10 (version 1)",
     "port": 2222,
+    "unknown_algorithms": [],
     "warnings": []
 }

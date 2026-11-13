@@ -1,6 +1,7 @@
 import pytest
 
 from ssh_audit.algorithm import Algorithm
+from ssh_audit.ssh2_kexdb import SSH2_KexDB
 from ssh_audit.timeframe import Timeframe
 
 
@@ -164,3 +165,51 @@ class TestAlgorithm:
         assert dv in str(tf)
         assert ov in repr(tf)
         assert dv in repr(tf)
+
+    def test_normalize_name_gss(self):
+        '''GSS key exchange names normalize their variable suffix to the database wildcard.'''
+
+        # Standard base64 suffix after the final dash.
+        assert self.algorithm.normalize_name('kex', 'gss-gex-sha1-vz8J1E9PzLr8b1K+0remTg==') == 'gss-gex-sha1-*'
+        assert self.algorithm.normalize_name('kex', 'gss-nistp256-sha256-RANDOMCHARSTOTESTWILDCARDMATCHING') == 'gss-nistp256-sha256-*'
+
+        # Suffixes containing dashes still resolve to the longest matching wildcard prefix.
+        assert self.algorithm.normalize_name('kex', 'gss-group16-sha512-RAND-OM==') == 'gss-group16-sha512-*'
+
+    def test_normalize_name_non_gss_unchanged(self):
+        '''Non-GSS names and non-kex types are returned untouched.'''
+
+        assert self.algorithm.normalize_name('kex', 'curve25519-sha256') == 'curve25519-sha256'
+        assert self.algorithm.normalize_name('enc', 'gss-whatever-suffix') == 'gss-whatever-suffix'
+        assert self.algorithm.normalize_name('key', 'ssh-ed25519') == 'ssh-ed25519'
+
+    def test_normalize_name_malformed_gss_no_crash(self):
+        '''A gss- name without a dash is returned unchanged instead of raising.'''
+
+        assert self.algorithm.normalize_name('kex', 'gss') == 'gss'
+        assert self.algorithm.normalize_name('kex', '') == ''
+        assert self.algorithm.lookup('kex', 'gss') is None
+
+    def test_lookup_gss_recognized(self):
+        '''The shared lookup recognizes GSS names with arbitrary suffixes and returns their database descriptor.'''
+
+        desc = self.algorithm.lookup('kex', 'gss-gex-sha1-vz8J1E9PzLr8b1K+0remTg==')
+        assert desc is not None
+        assert desc == SSH2_KexDB.get_db()['kex']['gss-gex-sha1-*']
+
+        # A different random suffix resolves to the same descriptor.
+        assert self.algorithm.lookup('kex', 'gss-gex-sha1-dZuIebMjgUqaxvbF7hDbAw==') == desc
+
+    def test_lookup_unknown(self):
+        '''The shared lookup returns None for unrecognized names.'''
+
+        assert self.algorithm.lookup('kex', 'totally-bogus-kex-xyz') is None
+        assert self.algorithm.lookup('enc', 'totally-bogus-enc-xyz') is None
+        # A 'gss-' prefix with no matching database wildcard is still unknown.
+        assert self.algorithm.lookup('kex', 'gss-does-not-exist-abc') is None
+
+    def test_lookup_known_regular_algorithm(self):
+        '''Regular algorithm names resolve exactly as before.'''
+
+        assert self.algorithm.lookup('kex', 'curve25519-sha256') == SSH2_KexDB.get_db()['kex']['curve25519-sha256']
+        assert self.algorithm.lookup('key', 'ssh-ed25519') == SSH2_KexDB.get_db()['key']['ssh-ed25519']

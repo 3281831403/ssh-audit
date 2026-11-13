@@ -1,14 +1,16 @@
 import os
+import json
 import struct
 import pytest
 
+from ssh_audit import exitcodes
 from ssh_audit.auditconf import AuditConf
 from ssh_audit.outputbuffer import OutputBuffer
 from ssh_audit.protocol import Protocol
 from ssh_audit.readbuf import ReadBuf
 from ssh_audit.ssh2_kex import SSH2_Kex
 from ssh_audit.ssh2_kexparty import SSH2_KexParty
-from ssh_audit.ssh_audit import audit
+from ssh_audit.ssh_audit import audit, output
 from ssh_audit.writebuf import WriteBuf
 
 
@@ -200,3 +202,132 @@ class TestSSH2:
         # Ensure that none of the lines are reported as "unknown algorithm".
         for line in lines:
             assert line.find('unknown algorithm') == -1
+
+    def _kex_payload_with_unknown_alg(self):
+        w = self.wbuf()
+        w.write(b'\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff')
+        # gss-gex-sha256-* carries only warnings in the database (no failures), so the unknown algorithm alone determines the exit code.
+        w.write_list(['gss-gex-sha256-vz8J1E9PzLr8b1K+0remTg==', 'totally-bogus-kex-xyz'])
+        w.write_list(['ssh-ed25519'])
+        w.write_list(['chacha20-poly1305@openssh.com'])
+        w.write_list(['chacha20-poly1305@openssh.com'])
+        w.write_list(['hmac-sha2-512-etm@openssh.com'])
+        w.write_list(['hmac-sha2-512-etm@openssh.com'])
+        w.write_list(['none'])
+        w.write_list(['none'])
+        w.write_list([''])
+        w.write_list([''])
+        w.write_byte(False)
+        w.write_int(0)
+        return w.write_flush()
+
+    def test_unknown_algorithm_text_warning_exit_code(self, output_spy, virtual_socket):
+        '''An unknown algorithm in a scan produces a warning and the WARNING exit code (2), not a failure.'''
+
+        vsocket = virtual_socket
+        w = self.wbuf()
+        w.write_byte(self.protocol.MSG_KEXINIT)
+        w.write(self._kex_payload_with_unknown_alg())
+        vsocket.rdata.append(b'SSH-2.0-OpenSSH_7.3 ssh-audit-test\r\n')
+        vsocket.rdata.append(self._create_ssh2_packet(w.write_flush()))
+        output_spy.begin()
+        out = self.OutputBuffer()
+        retval = self.audit(out, self._conf())
+        out.write()
+        lines = output_spy.flush()
+
+        assert retval == exitcodes.WARNING
+        assert any('[warn] unknown algorithm' in line and 'totally-bogus-kex-xyz' in line for line in lines)
+        # The GSS name is recognized and is never flagged as unknown.
+        assert not any('gss-gex-sha256' in line and 'unknown algorithm' in line for line in lines)
+
+    def test_json_matches_text_for_gss_and_unknown(self, virtual_socket):
+        '''JSON output recognizes the same GSS names as text and classifies unknown algorithms as warnings.'''
+
+        vsocket = virtual_socket
+        w = self.wbuf()
+        w.write_byte(self.protocol.MSG_KEXINIT)
+        w.write(self._kex_payload_with_unknown_alg())
+        vsocket.rdata.append(b'SSH-2.0-OpenSSH_7.3 ssh-audit-test\r\n')
+        vsocket.rdata.append(self._create_ssh2_packet(w.write_flush()))
+
+        conf = self._conf()
+        conf.json = True
+        out = self.OutputBuffer()
+        out.json = True
+        out.use_colors = False
+        self.audit(out, conf)
+        struct = json.loads(out.get_buffer())
+
+        # The GSS name is a known algorithm with its real notes, never "using unknown algorithm".
+        gss_entry = struct['kex'][0]
+        assert gss_entry['algorithm'] == 'gss-gex-sha256-vz8J1E9PzLr8b1K+0remTg=='
+        assert 'using unknown algorithm' not in json.dumps(gss_entry['notes'])
+        assert gss_entry['notes']['warn'] == ['does not provide protection against post-quantum attacks']
+
+        # The truly unknown algorithm is a warning, not a failure.
+        unknown_entry = struct['kex'][1]
+        assert unknown_entry['algorithm'] == 'totally-bogus-kex-xyz'
+        assert unknown_entry['notes'] == {'warn': ['using unknown algorithm']}
+
+        # The top-level list reports the unknown name (deduplicated, discovery order preserved).
+        assert struct['unknown_algorithms'] == ['totally-bogus-kex-xyz']
+
+    def _get_synthetic_kex(self):
+        '''Builds a fixed synthetic kex from plain lists for direct output() testing.'''
+        # gss-gex-sha256-* is warn-only, so unknown algorithms decide the overall exit code.
+        gss_name = 'gss-gex-sha256-dZuIebMjgUqaxvbF7hDbAw=='
+        cli = self.ssh2_kexparty([], [], ['none'], [])
+        srv = self.ssh2_kexparty(['aes128-ctr'], ['hmac-sha2-256'], ['none'], [])
+        cookie = b'\x00\x11\x22\x33\x44\x55\x66\x77\x88\x99\xaa\xbb\xcc\xdd\xee\xff'
+        return self.ssh2_kex(self.OutputBuffer, cookie,
+                             [gss_name, 'bogus-kex-A', 'bogus-kex-A'], ['ssh-ed25519', 'bogus-key-B'],
+                             cli, srv, 0)
+
+    def test_output_json_unknown_dedup_order(self):
+        '''output() with JSON records unknowns once, in discovery order, while recognizing GSS names.'''
+
+        kex = self._get_synthetic_kex()
+        conf = self.AuditConf('localhost', 22)
+        conf.json = True
+        conf.colors = False
+        conf.batch = True
+        conf.skip_rate_test = True
+
+        out = self.OutputBuffer()
+        out.json = True
+        out.use_colors = False
+        output(out, conf, None, [], kex=kex)
+        struct = json.loads(out.get_buffer())
+
+        # Duplicate bogus-kex-A within the kex list is deduplicated; key-list unknown comes second.
+        assert struct['unknown_algorithms'] == ['bogus-kex-A', 'bogus-key-B']
+
+        gss_entry = struct['kex'][0]
+        assert gss_entry['algorithm'] == 'gss-gex-sha256-dZuIebMjgUqaxvbF7hDbAw=='
+        assert 'using unknown algorithm' not in json.dumps(gss_entry['notes'])
+
+    def test_output_text_unknown_is_warning(self):
+        '''Text output marks unknown algorithms as warnings and returns the WARNING exit code.'''
+
+        kex = self._get_synthetic_kex()
+        conf = self.AuditConf('localhost', 22)
+        conf.json = False
+        conf.colors = False
+        conf.batch = True
+        conf.skip_rate_test = True
+
+        out = self.OutputBuffer()
+        out.use_colors = False
+        retval = output(out, conf, None, [], kex=kex)
+        text = out.get_buffer()
+
+        assert retval == exitcodes.WARNING
+        # Names are padded to the section width, so match on the name and note rather than exact spacing.
+        assert '(kex) bogus-kex-A' in text and '[warn] unknown algorithm' in text
+        assert '(key) bogus-key-B' in text
+        # The GSS name is recognized and renders its database notes, not an unknown warning.
+        assert 'gss-gex-sha256-dZuIebMjgUqaxvbF7hDbAw==' in text
+        gss_line = [line for line in text.split('\n') if 'gss-gex-sha256' in line][0]
+        assert 'unknown algorithm' not in gss_line
+        assert 'does not provide protection against post-quantum attacks' in gss_line

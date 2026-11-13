@@ -4,5 +4,6 @@
     "passed": true,
     "policy": "Docker poliicy: test7 (version 1)",
     "port": 2222,
+    "unknown_algorithms": [],
     "warnings": []
 }

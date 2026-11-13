@@ -487,5 +487,6 @@
             }
         }
     },
-    "target": "localhost:2222"
+    "target": "localhost:2222",
+    "unknown_algorithms": []
 }

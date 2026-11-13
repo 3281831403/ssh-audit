@@ -122,18 +122,13 @@ def output_algorithm(out: OutputBuffer, alg_db: Dict[str, Dict[str, List[List[Op
             alg_name_with_size = '%s (%u-bit)' % (alg_name, hostkey_size)
             padding = padding[0:-11]
 
-    # If this is a kex algorithm and starts with 'gss-', then normalize its name (i.e.: 'gss-gex-sha1-vz8J1E9PzLr8b1K+0remTg==' => 'gss-gex-sha1-*').  The base64 field can vary, so we'll convert it to the wildcard that our database uses and we'll just resume doing a straight match like all other algorithm names.
-    alg_name_original = alg_name
-    if alg_type == 'kex' and alg_name.startswith('gss-'):
-        last_dash = alg_name.rindex('-')
-        alg_name = "%s-*" % alg_name[0:last_dash]
-
+    # GSS key exchange names carry a variable suffix, but the output always reports the original, unmodified name.  Name resolution (including GSS wildcard normalization) goes through the shared Algorithm.lookup() so that text output, JSON output, and --lookup all recognize the same algorithms.
     texts = []
     if len(alg_name.strip()) == 0:
         return program_retval
     alg_name_native = Utils.to_text(alg_name)
-    if alg_name_native in alg_db[alg_type]:
-        alg_desc = alg_db[alg_type][alg_name_native]
+    alg_desc = Algorithm.lookup(alg_type, alg_name_native)
+    if alg_desc is not None:
         ldesc = len(alg_desc)
         for idx, level in enumerate(['fail', 'warn', 'info']):
             if level == 'info':
@@ -151,11 +146,7 @@ def output_algorithm(out: OutputBuffer, alg_db: Dict[str, Dict[str, List[List[Op
             texts.append(('info', ''))
     else:
         texts.append(('warn', 'unknown algorithm'))
-        unknown_algs.append(alg_name)
-
-    # For kex GSS algorithms, now that we already did the database lookup (above), restore the original algorithm name so its reported properly in the output.
-    if alg_name != alg_name_original:
-        alg_name = alg_name_original
+        unknown_algs.append(alg_name_native)
 
     alg_name = alg_name_with_size if alg_name_with_size is not None else alg_name
     first = True
@@ -997,19 +988,20 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
 
     def fetch_notes(algorithm: str, alg_type: str) -> Dict[str, List[Optional[str]]]:
         '''Returns a dictionary containing the messages in the "fail", "warn", and "info" levels for this algorithm.'''
-        alg_db = SSH2_KexDB.get_db()
         alg_info = {}
-        if algorithm in alg_db[alg_type]:
-            alg_desc = alg_db[alg_type][algorithm]
+
+        # Algorithm recognition goes through the same shared lookup as text output (which handles GSS wildcard normalization), so the two can never disagree.
+        alg_desc = Algorithm.lookup(alg_type, Utils.to_text(algorithm))
+        if alg_desc is not None:
             alg_desc_len = len(alg_desc)
 
-            # If a list for the failure notes exists, add it to the return value.  Similarly, add the related lists for the warnings and informational notes.
+            # If a list for the failure notes exists, add it to the return value.  Similarly, add the related lists for the warnings and informational notes.  Copies are taken so the derived "available since" text below is never appended back into the shared thread-local database.
             if (alg_desc_len >= 2) and (len(alg_desc[1]) > 0):
-                alg_info["fail"] = alg_desc[1]
+                alg_info["fail"] = list(alg_desc[1])
             if (alg_desc_len >= 3) and (len(alg_desc[2]) > 0):
-                alg_info["warn"] = alg_desc[2]
+                alg_info["warn"] = list(alg_desc[2])
             if (alg_desc_len >= 4) and (len(alg_desc[3]) > 0):
-                alg_info["info"] = alg_desc[3]
+                alg_info["info"] = list(alg_desc[3])
 
             # Add information about when this algorithm was implemented in OpenSSH/Dropbear.
             since_text = Algorithm.get_since_text(alg_desc[0])
@@ -1019,7 +1011,8 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
                     alg_info["info"] = []
                 alg_info["info"].append(since_text)
         else:
-            alg_info["fail"] = [SSH2_KexDB.FAIL_UNKNOWN]
+            # Unknown algorithms are warnings (matching the text output and the scan's exit code), not failures.
+            alg_info["warn"] = [SSH2_KexDB.FAIL_UNKNOWN]
 
         return alg_info
 
@@ -1048,12 +1041,24 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
     else:
         res['target'] = target_host
 
+    # Unknown algorithms, deduplicated in the order they were discovered across all four algorithm lists.  This stays an empty list when no kex is available, so the field is always present in the JSON output.
+    unknown_algorithms: List[str] = []
+
     if kex is not None:
         res['compression'] = kex.server.compression
+
+        def is_unknown(algorithm: str, alg_type: str) -> bool:
+            '''Returns True if the algorithm name cannot be resolved through the shared lookup, recording it (once, in discovery order) in the top-level unknown_algorithms list.'''
+            if Algorithm.lookup(alg_type, Utils.to_text(algorithm)) is None:
+                if algorithm not in unknown_algorithms:
+                    unknown_algorithms.append(algorithm)
+                return True
+            return False
 
         res['kex'] = []
         dh_alg_sizes = kex.dh_modulus_sizes()
         for algorithm in kex.kex_algorithms:
+            is_unknown(algorithm, 'kex')
             alg_notes = fetch_notes(algorithm, 'kex')
             entry: Any = {
                 'algorithm': algorithm,
@@ -1066,6 +1071,7 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
         res['key'] = []
         host_keys = kex.host_keys()
         for algorithm in kex.key_algorithms:
+            is_unknown(algorithm, 'key')
             alg_notes = fetch_notes(algorithm, 'key')
             entry = {
                 'algorithm': algorithm,
@@ -1091,6 +1097,7 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
 
         res['enc'] = []
         for algorithm in kex.server.encryption:
+            is_unknown(algorithm, 'enc')
             alg_notes = fetch_notes(algorithm, 'enc')
             entry = {
                 'algorithm': algorithm,
@@ -1100,6 +1107,7 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
 
         res['mac'] = []
         for algorithm in kex.server.mac:
+            is_unknown(algorithm, 'mac')
             alg_notes = fetch_notes(algorithm, 'mac')
             entry = {
                 'algorithm': algorithm,
@@ -1108,9 +1116,9 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
             res['mac'].append(entry)
 
         res['fingerprints'] = []
-        host_keys = kex.host_keys()
 
-        # Normalize all RSA key types to 'ssh-rsa'.  Otherwise, due to Python's order-indifference dictionary types, we would iterate key types in unpredictable orders, which interferes with the docker testing framework (i.e.: tests would fail because elements are reported out of order, even though the output is semantically the same).
+        # Normalize all RSA key types to 'ssh-rsa' on a local copy of the host keys dictionary.  Otherwise, due to Python's order-indifference dictionary types, we would iterate key types in unpredictable orders, which interferes with the docker testing framework (i.e.: tests would fail because elements are reported out of order, even though the output is semantically the same).  The kex object itself must remain untouched, since callers (such as policy evaluations run after the report is built) still need the original host key types.
+        host_keys = dict(kex.host_keys())
         for host_key_type in list(host_keys.keys())[:]:
             if host_key_type in HostKeyTest.RSA_FAMILY:
                 val = host_keys[host_key_type]
@@ -1141,6 +1149,9 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
 
     # Historically, CVE information was returned.  Now we'll just return an empty dictionary so as to not break any legacy clients.
     res['cves'] = []
+
+    # The complete list of unknown algorithms encountered during the scan, deduplicated while preserving discovery order.
+    res['unknown_algorithms'] = unknown_algorithms
 
     # Add in the recommendations.
     res['recommendations'] = get_algorithm_recommendations(algorithms, algorithm_recommendation_suppress_list, software, for_server=True)
@@ -1271,18 +1282,13 @@ def algorithm_lookup(out: OutputBuffer, alg_names: str) -> int:
     algorithm_names = alg_names.split(",")
     adb = SSH2_KexDB.get_db()
 
-    # Use nested dictionary comprehension to iterate an outer dictionary where
-    # each key is an alg type that consists of a value (which is itself a
-    # dictionary) of alg names. Filter the alg names against the user supplied
-    # list of names.
-    algorithms_dict = {
-        outer_k: {
-            inner_k
-            for (inner_k, inner_v) in outer_v.items()
-            if inner_k in algorithm_names
-        }
-        for (outer_k, outer_v) in adb.items()
-    }
+    # Resolve each user-supplied name through the shared lookup (which applies GSS wildcard normalization), keyed by algorithm type.  As with every other code path, recognition is decided solely by Algorithm.lookup(), while the original, unmodified names are kept for display and for reporting unknowns.
+    algorithms_dict: Dict[str, List[str]] = {alg_type: [] for alg_type in alg_types}
+    for algorithm_name in algorithm_names:
+        for alg_type in alg_types:
+            if Algorithm.lookup(alg_type, algorithm_name) is not None:
+                algorithms_dict[alg_type].append(algorithm_name)
+                break
 
     unknown_algorithms: List[str] = []
     padding = len(max(algorithm_names, key=len))
